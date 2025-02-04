@@ -1,29 +1,75 @@
 import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow import keras
-from tensorflow.keras.layers import Dense, Flatten, Input
+from tensorflow.keras.layers import Dense, Flatten, Input, MaxPooling2D, Conv2D, Dropout
 import numpy as np
 import time
 import os
 import flet as ft
 from PIL import Image
 
+
+TUMOR_CLASSES = {
+    0: "нет опухоли",
+    1: "глиома",
+    2: "менингиома",
+    3: "питуитарная"
+}
+
+
+def create_model(num_classes):
+    model = tf.keras.Sequential([
+        Input(shape=(224, 224, 3)),
+        Conv2D(32, (3, 3), activation='relu'),
+        Conv2D(64, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Dropout(0.25),
+        Conv2D(64, (3, 3), activation='relu'),
+        Conv2D(64, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Dropout(0.25),
+        Conv2D(128, (3, 3), activation='relu'),
+        Conv2D(128, (3, 3), activation='relu'),
+        Conv2D(128, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Dropout(0.2),
+        Conv2D(128, (3, 3), activation='relu'),
+        Conv2D(256, (3, 3), activation='relu'),
+        MaxPooling2D((2, 2)),
+        Flatten(),
+        Dense(512, activation='relu'),
+        Dropout(0.3),
+        Dense(512, activation='relu'),
+        Dropout(0.3),
+        Dense(num_classes, activation='softmax')
+    ])
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
+                  loss=tf.keras.losses.CategoricalCrossentropy(),
+                  metrics=['accuracy'])
+
+    return model
+
+
 def predict(model, image_patch):
-    img = Image.open(image_patch).convert("L")
+    img = Image.open(image_patch)
     img = img.resize((224, 224))
     img_array = np.array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=[0, -1])
+    img_array = np.expand_dims(img_array, axis=0)
 
-    prediction = model(img_array, training=False),
-    predicted_class = tf.argmax(prediction, axis=1).numpy()[0]
-    confidence = tf.reduce_max(prediction).numpy()
+    prediction = model.predict(img_array)
+    predicted_class = tf.argmax(prediction, axis=1)[0].numpy()
+    confidence = np.max(prediction)
 
-    return predicted_class, confidence
+    result = TUMOR_CLASSES.get(int(predicted_class), "неизвестная опухоль")
+    return result, confidence
+
 
 def train_model(data_dir):
     start_time = time.time()
 
     image_size = (224, 224)
-    batch_size = 64
+    batch_size = 32
 
     if not os.path.exists(data_dir):
         return f"директория не найдена: {data_dir}"
@@ -36,53 +82,71 @@ def train_model(data_dir):
     for subdir in subdirs:
         print(f"- {os.path.basename(subdir)}")
 
-    train_dataset = tf.keras.preprocessing.image_dataset_from_directory(
-        data_dir,
-        labels='inferred',
-        label_mode='int',
-        image_size=image_size,
-        batch_size=batch_size,
-        color_mode='rgb',
+    datagen = ImageDataGenerator(
+        rescale=1./255,
+        rotation_range=20,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        horizontal_flip=True,
         validation_split=0.2,
-        subset='training',
-        seed=123,
-        shuffle=True,
-        interpolation='bilinear'
     )
 
-    def process_image(image, label):
-        image = tf.image.rgb_to_grayscale(image)
-        image = tf.image.resize(image, image_size)
-        image = tf.cast(image, tf.float32) / 255.0
-        label = tf.one_hot(label, len(subdirs))
-        return image, label
+    train_generator = datagen.flow_from_directory(
+        data_dir,
+        target_size=image_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        subset='training',
+    )
 
-    train_dataset = train_dataset.map(process_image).cache().shuffle(1000).prefetch(buffer_size=tf.data.AUTOTUNE)
+    validation_generator = datagen.flow_from_directory(
+        data_dir,
+        target_size=image_size,
+        batch_size=batch_size,
+        class_mode='categorical',
+        subset='validation',
+    )
 
-    inputs = Input(shape=(224, 224, 1))
-    x = Flatten()(inputs)
-    x = Dense(128, activation='relu')(x)
-    x = Dense(128, activation='relu')(x)
-    x = Dense(len(subdirs), activation='softmax')(x)
-    outputs = x
-    model = keras.Model(inputs=inputs, outputs=outputs)
+    num_classes = len(subdirs)
+    model = create_model(num_classes)
 
-    model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
-                  loss=tf.keras.losses.CategoricalCrossentropy(),
-                  metrics=['accuracy'])
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_accuracy', patience=10, verbose=1, mode='max')
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_accuracy', mode='max', patience=3, factor=0.5,
+                                                     min_lr=1e-6, verbose=2)
+    model_checkpoint = tf.keras.callbacks.ModelCheckpoint(filepath='best_model.keras', monitor='val_accuracy',
+                                                          save_best_only=True, mode='max')
 
-    model.fit(train_dataset, epochs=10)
+    history = model.fit(
+        train_generator,
+        steps_per_epoch=train_generator.samples // batch_size,
+        validation_data=validation_generator,
+        epochs=100,
+        callbacks=[early_stopping, reduce_lr, model_checkpoint],
+    )
+
+    accuracy = history.history['accuracy'][-1]
+    val_accuracy = history.history['val_accuracy'][-1]
+    loss = history.history['loss'][-1]
+    val_loss = history.history['val_loss'][-1]
 
     end_time = time.time()
     training_time = end_time - start_time
 
-    model.save('brain_tumor_model.keras')
+    best_model = tf.keras.models.load_model('best_model.keras')
+    best_model.save('brain_tumor_model.keras')
+    return f"тренировочное время: {training_time:.2f} секунд, точность: {accuracy:.2f}, валидационная точность: {val_accuracy:.2f}, потеря: {loss:.4f}, валидационная потеря: {val_loss:.4f}"
 
-    return f"тренировочное время: {training_time} секунд"
+
+def process_image(image, label, num_classes):
+    image = tf.image.rgb_to_grayscale(image)
+    image = tf.image.resize(image, (224, 224))
+    image = tf.cast(image, tf.float32) / 255.0
+    label = tf.one_hot(label, depth=num_classes)
+    return image, label
 
 
 def flet_app(page:ft.Page):
-    page.title = "BrainTrumor"
+    page.title = "BrainTumor"
 
     data_dir = ft.Ref[ft.TextField]()
     result_text = ft.Ref[ft.Text]()
@@ -101,22 +165,24 @@ def flet_app(page:ft.Page):
             result_text.current.value = result
         page.update()
 
+
     def make_prediction(e):
         global trained_model
-        trained_model = keras.models.load_model(
-            'brain_tumor_model.keras'
-        )
-        if trained_model is None:
-            prediction_result.current.value = "модель не обучена"
-        elif not image_patch.current.value:
+        if 'trained_model' not in globals():
+            try:
+                trained_model = keras.models.load_model('brain_tumor_model.keras')
+            except:
+                prediction_result.current.value = "модель не найдена"
+
+        if not image_patch.current.value:
             prediction_result.current.value = "укажите путь к изображению"
         else:
             try:
-                class_id, confidence = predict(trained_model, image_patch.current.value)
-                prediction_result.current.value = f"предсказание: {class_id}, уверенность: {confidence:.2f}"
-                print(class_id, confidence)
+                result, confidence = predict(trained_model, image_patch.current.value)
+                prediction_result.current.value = f"результат: {result}\nуверенность: {confidence:.2f}"
             except Exception as ex:
                 prediction_result.current.value = f"ошибка предсказания: {str(ex)}"
+        page.update()
 
 
     page.add(
